@@ -40,6 +40,13 @@ import msgpack
 import numpy as np
 import websockets
 
+try:
+    import pyvirtualcam
+    _VCAM_AVAILABLE = True
+except ImportError:
+    _VCAM_AVAILABLE = False
+    print("[vcam] pyvirtualcam not installed — virtual camera disabled")
+
 _SOURCE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 # ------------------------------------------------------------------ #
@@ -362,53 +369,73 @@ _ENHANCE_LABELS = {None: "off", "gpen256": "GPEN-256", "gpen512": "GPEN-512"}
 _DISPLAY_INTERVAL_MS = 33
 
 
-def _display_loop(params_ref: dict, source_path_ref: list):
+def _display_loop(params_ref: dict, source_path_ref: list, width: int = 1280, height: int = 720):
     print("[display] q=quit  s=resend source  r=cycle enhance  m=mouth mask  +/-=opacity")
 
-    while True:
-        frame = _get_display_frame()
+    vcam = None
+    if _VCAM_AVAILABLE:
+        try:
+            vcam = pyvirtualcam.Camera(width=width, height=height, fps=30,
+                                       fmt=pyvirtualcam.PixelFormat.RGB)
+            print(f"[vcam] Virtual camera active: {vcam.device}")
+        except Exception as e:
+            print(f"[vcam] Could not open virtual camera: {e}")
 
-        if frame is not None:
-            display = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    try:
+        while True:
+            frame = _get_display_frame()
 
-            enhance_label = _ENHANCE_LABELS[params_ref.get("enhance")]
-            mouth_on  = params_ref.get("mouth_mask", False)
-            opacity   = params_ref.get("opacity", 1.0)
-            swap_fps  = _live_stats["swap_fps"]
-            rt_ms     = _live_stats["rt_ms"]
-            rt_str    = f"{rt_ms:.0f}ms" if rt_ms else "—"
+            if frame is not None:
+                display = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-            cv2.putText(display, f"Swap {swap_fps:.1f}fps  rt {rt_str}",
-                        (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(display,
-                        f"Enhance: {enhance_label}  Mouth: {'on' if mouth_on else 'off'}  Opacity: {opacity:.2f}",
-                        (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 2)
-            cv2.imshow("Rope — Face Swap", display)
+                enhance_label = _ENHANCE_LABELS[params_ref.get("enhance")]
+                mouth_on  = params_ref.get("mouth_mask", False)
+                opacity   = params_ref.get("opacity", 1.0)
+                swap_fps  = _live_stats["swap_fps"]
+                rt_ms     = _live_stats["rt_ms"]
+                rt_str    = f"{rt_ms:.0f}ms" if rt_ms else "—"
 
-        key = cv2.waitKey(_DISPLAY_INTERVAL_MS) & 0xFF
-        if key == ord('q'):
-            break
-        elif key == ord('s'):
-            if source_path_ref[0] and _ws_loop and _ws_ref:
-                asyncio.run_coroutine_threadsafe(
-                    _send_source(_ws_ref[0], source_path_ref[0]),
-                    _ws_loop)
-        elif key == ord('r'):
-            cur = params_ref.get("enhance")
-            nxt = _ENHANCE_MODES[(_ENHANCE_MODES.index(cur) + 1) % len(_ENHANCE_MODES)]
-            params_ref["enhance"] = nxt
-            print(f"[params] enhance: {_ENHANCE_LABELS[nxt]}")
-        elif key == ord('m'):
-            params_ref["mouth_mask"] = not params_ref.get("mouth_mask", False)
-            print(f"[params] mouth_mask: {'on' if params_ref['mouth_mask'] else 'off'}")
-        elif key == ord('+'):
-            params_ref["opacity"] = round(min(params_ref.get("opacity", 1.0) + 0.05, 1.0), 2)
-            print(f"[params] opacity: {params_ref['opacity']:.2f}")
-        elif key == ord('-'):
-            params_ref["opacity"] = round(max(params_ref.get("opacity", 1.0) - 0.05, 0.0), 2)
-            print(f"[params] opacity: {params_ref['opacity']:.2f}")
+                cv2.putText(display, f"Swap {swap_fps:.1f}fps  rt {rt_str}",
+                            (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(display,
+                            f"Enhance: {enhance_label}  Mouth: {'on' if mouth_on else 'off'}  Opacity: {opacity:.2f}",
+                            (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 2)
+                cv2.imshow("Rope — Face Swap", display)
 
-    cv2.destroyAllWindows()
+                if vcam is not None:
+                    out = frame  # already RGB
+                    if out.shape[1] != width or out.shape[0] != height:
+                        out = cv2.resize(out, (width, height))
+                    vcam.send(np.ascontiguousarray(out))
+            elif vcam is not None:
+                vcam.send(np.zeros((height, width, 3), dtype=np.uint8))
+
+            key = cv2.waitKey(_DISPLAY_INTERVAL_MS) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('s'):
+                if source_path_ref[0] and _ws_loop and _ws_ref:
+                    asyncio.run_coroutine_threadsafe(
+                        _send_source(_ws_ref[0], source_path_ref[0]),
+                        _ws_loop)
+            elif key == ord('r'):
+                cur = params_ref.get("enhance")
+                nxt = _ENHANCE_MODES[(_ENHANCE_MODES.index(cur) + 1) % len(_ENHANCE_MODES)]
+                params_ref["enhance"] = nxt
+                print(f"[params] enhance: {_ENHANCE_LABELS[nxt]}")
+            elif key == ord('m'):
+                params_ref["mouth_mask"] = not params_ref.get("mouth_mask", False)
+                print(f"[params] mouth_mask: {'on' if params_ref['mouth_mask'] else 'off'}")
+            elif key == ord('+'):
+                params_ref["opacity"] = round(min(params_ref.get("opacity", 1.0) + 0.05, 1.0), 2)
+                print(f"[params] opacity: {params_ref['opacity']:.2f}")
+            elif key == ord('-'):
+                params_ref["opacity"] = round(max(params_ref.get("opacity", 1.0) - 0.05, 0.0), 2)
+                print(f"[params] opacity: {params_ref['opacity']:.2f}")
+    finally:
+        if vcam is not None:
+            vcam.close()
+        cv2.destroyAllWindows()
 
 
 # ------------------------------------------------------------------ #
@@ -501,7 +528,7 @@ def main():
     ws_thread = threading.Thread(target=_run_ws, daemon=True)
     ws_thread.start()
 
-    _display_loop(params_ref, source_path_ref)
+    _display_loop(params_ref, source_path_ref, width=args.width, height=args.height)
 
 
 if __name__ == "__main__":

@@ -5,3 +5,4 @@ msgpack>=1.0.7
 websockets>=12.0
 numpy>=1.23.0
 python-dotenv>=1.0.0
+pyvirtualcam>=0.10.0
