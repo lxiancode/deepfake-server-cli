@@ -247,17 +247,22 @@ async def websocket_endpoint(websocket: WebSocket):
             frame_id, frame_bytes, s_face, params = item
             t0 = time.perf_counter()
             try:
-                result_bytes = await loop.run_in_executor(
+                result_bytes, metrics = await loop.run_in_executor(
                     _executor, _process_frame_sync, frame_bytes, s_face, params)
                 elapsed = (time.perf_counter() - t0) * 1000
                 if result_bytes is not None:
                     if _verbose:
                         print(f"[proc] frame {frame_id} done in {elapsed:.1f} ms "
-                              f"({len(result_bytes)//1024}KB)")
+                              f"({len(result_bytes)//1024}KB)"
+                              + (f"  sharp={metrics.get('sharpness', 0):.0f}"
+                                 f"  det={metrics.get('det_score', 0):.2f}"
+                                 f"  flicker={metrics.get('temporal_diff', 0):.1f}"
+                                 if metrics else ""))
                     await _send(websocket, {
                         "type": "frame_result",
                         "frame_id": frame_id,
                         "frame": result_bytes,
+                        "metrics": metrics,
                     })
                 else:
                     await _send(websocket, {
@@ -284,17 +289,55 @@ async def websocket_endpoint(websocket: WebSocket):
 # Synchronous GPU processing                                           #
 # ------------------------------------------------------------------ #
 
-def _process_frame_sync(frame_bytes: bytes, source_face, params: dict) -> bytes | None:
-    """Decode JPEG → detect → swap → optional enhance → re-encode JPEG."""
+def _compute_quality_metrics(
+    result_bgr: np.ndarray,
+    pre_blend_bgr: np.ndarray,
+    prev_bgr: np.ndarray | None,
+    target_faces,
+) -> dict:
+    """Compute lightweight per-frame quality metrics (all NumPy/OpenCV, no extra deps)."""
+    metrics: dict = {}
+
+    # Sharpness: Laplacian variance of the largest face crop in the final output.
+    if target_faces:
+        best = max(target_faces,
+                   key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+        metrics["det_score"] = float(best.det_score)
+        x1, y1, x2, y2 = [int(v) for v in best.bbox]
+        h, w = result_bgr.shape[:2]
+        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+        crop = result_bgr[y1:y2, x1:x2]
+        if crop.size > 0:
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            metrics["sharpness"] = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    # Temporal flicker: mean absolute difference between consecutive pre-blend
+    # frames.  Measured before blending so we capture raw GAN variance.
+    if prev_bgr is not None and prev_bgr.shape == pre_blend_bgr.shape:
+        diff = np.abs(pre_blend_bgr.astype(np.float32) - prev_bgr.astype(np.float32))
+        metrics["temporal_diff"] = float(diff.mean())
+
+    return metrics
+
+
+def _process_frame_sync(
+    frame_bytes: bytes, source_face, params: dict
+) -> tuple[bytes | None, dict]:
+    """Decode JPEG → detect → swap → optional enhance → re-encode JPEG.
+
+    Returns (jpeg_bytes_or_None, quality_metrics_dict).
+    """
     nparr = np.frombuffer(frame_bytes, np.uint8)
     frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if frame_bgr is None:
-        return None
+        return None, {}
 
     # Apply per-frame params to globals (safe: single-threaded executor)
     modules.globals.opacity = float(params.get("opacity", 1.0))
     modules.globals.mouth_mask = bool(params.get("mouth_mask", False))
     modules.globals.sharpness = float(params.get("sharpness", 0.0))
+    modules.globals.poisson_blend = bool(params.get("poisson_blend", False))
+    modules.globals.interpolation_weight = float(params.get("interpolation_weight", 0.0))
     enhance = params.get("enhance")  # None | "gpen256" | "gpen512"
 
     t_det = time.perf_counter()
@@ -306,7 +349,7 @@ def _process_frame_sync(frame_bytes: bytes, source_face, params: dict) -> bytes 
 
     if not target_faces:
         ok, buf = cv2.imencode('.jpg', frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        return buf.tobytes() if ok else None
+        return (buf.tobytes() if ok else None), {}
 
     t_swap = time.perf_counter()
     result = frame_bgr
@@ -325,16 +368,24 @@ def _process_frame_sync(frame_bytes: bytes, source_face, params: dict) -> bytes 
         if _verbose:
             print(f"[proc] enhance({enhance}) {(time.perf_counter()-t_enh)*1000:.1f}ms")
 
+    # Capture pre-blend result for flicker measurement before temporal smoothing.
+    pre_blend = result.copy()
+
     # Temporal blend with previous frame to suppress GAN flicker.
     # 25% weight on the previous output keeps ghosting negligible while
     # significantly damping per-pixel noise between consecutive frames.
     global _prev_result_bgr
     if _prev_result_bgr is not None and _prev_result_bgr.shape == result.shape:
         result = cv2.addWeighted(result, 0.75, _prev_result_bgr, 0.25, 0)
-    _prev_result_bgr = result.copy()
+
+    metrics = _compute_quality_metrics(result, pre_blend, _prev_result_bgr, target_faces)
+    if metrics and not getattr(_process_frame_sync, "_metrics_logged", False):
+        print(f"[metrics] first frame: {metrics}")
+        _process_frame_sync._metrics_logged = True
+    _prev_result_bgr = pre_blend  # track pre-blend so temporal_diff reflects raw GAN variance
 
     ok, buf = cv2.imencode('.jpg', result, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    return buf.tobytes() if ok else None
+    return (buf.tobytes() if ok else None), metrics
 
 
 # ------------------------------------------------------------------ #

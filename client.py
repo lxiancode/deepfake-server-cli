@@ -18,7 +18,9 @@ Keys:
     s    - resend source to server
     r    - cycle enhance mode: off → GPEN-256 → GPEN-512 → off
     m    - toggle mouth mask
+    p    - toggle Poisson blend
     +/-  - opacity up / down (0.05 steps)
+    [/]  - interpolation_weight down / up (0.05 steps)
 """
 
 import argparse
@@ -148,6 +150,10 @@ _send_times: dict[int, float] = {}
 # Live stats exposed to the display overlay (written by stats thread).
 _live_stats: dict = {"swap_fps": 0.0, "rt_ms": 0.0}
 
+# Quality metrics forwarded from server (written by receiver, read by display).
+_quality_lock = threading.Lock()
+_quality_metrics: dict = {"sharpness": None, "det_score": None, "temporal_diff": None}
+
 
 def _stats_printer():
     while True:
@@ -166,7 +172,7 @@ def _stats_printer():
         rt_ms = sum(rts) / len(rts) if rts else 0.0
         _live_stats["swap_fps"] = swap_fps
         _live_stats["rt_ms"] = rt_ms
-        rt_str = f"{rt_ms:.0f}ms" if rt_ms else "—"
+        rt_str = f"{rt_ms:.0f}ms" if rt_ms else "--"
         print(
             f"[client] capture={captured/2:.1f}fps  "
             f"sent={sent/2:.1f}fps  "
@@ -310,6 +316,16 @@ async def _receiver(ws):
             fid = msg.get("frame_id", -1)
             frame_bytes = msg.get("frame")
 
+            # Update quality metrics from server if present.
+            server_metrics = msg.get("metrics")
+            if server_metrics is not None:
+                with _quality_lock:
+                    for k in ("sharpness", "det_score", "temporal_diff"):
+                        if k in server_metrics:
+                            _quality_metrics[k] = server_metrics[k]
+                if not any(server_metrics.values()):
+                    print(f"[metrics] frame {fid}: received empty metrics dict")
+
             if frame_bytes:
                 # Decode + upscale in a thread so the event loop stays free.
                 nparr = np.frombuffer(frame_bytes, np.uint8)
@@ -369,8 +385,16 @@ _ENHANCE_LABELS = {None: "off", "gpen256": "GPEN-256", "gpen512": "GPEN-512"}
 _DISPLAY_INTERVAL_MS = 33
 
 
+_WIN = "Rope — Face Swap"
+
+
 def _display_loop(params_ref: dict, source_path_ref: list, width: int = 1280, height: int = 720):
-    print("[display] q=quit  s=resend source  r=cycle enhance  m=mouth mask  +/-=opacity")
+    print("[display] q=quit  s=resend source  r=cycle enhance  m=mouth mask")
+
+    cv2.namedWindow(_WIN)
+
+    def _noop(_): pass
+    cv2.createTrackbar("Opacity %", _WIN, 100, 100, _noop)
 
     vcam = None
     if _VCAM_AVAILABLE:
@@ -383,24 +407,36 @@ def _display_loop(params_ref: dict, source_path_ref: list, width: int = 1280, he
 
     try:
         while True:
+            # Read trackbar values and push into params each frame.
+            params_ref["opacity"] = cv2.getTrackbarPos("Opacity %", _WIN) / 100.0
+
             frame = _get_display_frame()
 
             if frame is not None:
                 display = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
                 enhance_label = _ENHANCE_LABELS[params_ref.get("enhance")]
-                mouth_on  = params_ref.get("mouth_mask", False)
-                opacity   = params_ref.get("opacity", 1.0)
-                swap_fps  = _live_stats["swap_fps"]
-                rt_ms     = _live_stats["rt_ms"]
-                rt_str    = f"{rt_ms:.0f}ms" if rt_ms else "—"
+                mouth_on      = params_ref.get("mouth_mask", False)
+                swap_fps      = _live_stats["swap_fps"]
+                rt_ms         = _live_stats["rt_ms"]
+                rt_str        = f"{rt_ms:.0f}ms" if rt_ms else "--"
+
+                with _quality_lock:
+                    qm = _quality_metrics.copy()
+
+                sharp_str   = f"{qm['sharpness']:.0f}"    if qm["sharpness"]      is not None else "--"
+                det_str     = f"{qm['det_score']:.2f}"    if qm["det_score"]      is not None else "--"
+                flicker_str = f"{qm['temporal_diff']:.1f}" if qm["temporal_diff"] is not None else "--"
 
                 cv2.putText(display, f"Swap {swap_fps:.1f}fps  rt {rt_str}",
                             (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.putText(display,
-                            f"Enhance: {enhance_label}  Mouth: {'on' if mouth_on else 'off'}  Opacity: {opacity:.2f}",
+                            f"Enhance: {enhance_label}  Mouth: {'on' if mouth_on else 'off'}",
                             (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 2)
-                cv2.imshow("Rope — Face Swap", display)
+                cv2.putText(display,
+                            f"Sharp: {sharp_str}  Det: {det_str}  Flicker: {flicker_str}",
+                            (10, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 180, 0), 2)
+                cv2.imshow(_WIN, display)
 
                 if vcam is not None:
                     out = frame  # already RGB
@@ -426,12 +462,6 @@ def _display_loop(params_ref: dict, source_path_ref: list, width: int = 1280, he
             elif key == ord('m'):
                 params_ref["mouth_mask"] = not params_ref.get("mouth_mask", False)
                 print(f"[params] mouth_mask: {'on' if params_ref['mouth_mask'] else 'off'}")
-            elif key == ord('+'):
-                params_ref["opacity"] = round(min(params_ref.get("opacity", 1.0) + 0.05, 1.0), 2)
-                print(f"[params] opacity: {params_ref['opacity']:.2f}")
-            elif key == ord('-'):
-                params_ref["opacity"] = round(max(params_ref.get("opacity", 1.0) - 0.05, 0.0), 2)
-                print(f"[params] opacity: {params_ref['opacity']:.2f}")
     finally:
         if vcam is not None:
             vcam.close()
