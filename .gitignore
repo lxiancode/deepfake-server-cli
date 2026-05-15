@@ -9,3 +9,8 @@ __pycache__/
 *.pth
 *.ckpt
 .DS_Store
+
+# Ignore Markdown files, but keep README
+*.md
+!README.md
+!README.MD
