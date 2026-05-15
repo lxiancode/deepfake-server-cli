@@ -13,4 +13,4 @@ __pycache__/
 # Ignore Markdown files, but keep README
 *.md
 !README.md
-!README.MD
+!README.MDvoice_convert.py
